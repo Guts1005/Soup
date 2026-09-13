@@ -426,10 +426,10 @@ def tool_registry_show(args: dict) -> dict:
 def _resolve_gpu_memory_mcp(gpu: str | None) -> float:
     """GPU memory in GB from a flag or auto-detection (non-Typer mirror of
     ``commands/profile.py::_resolve_gpu_memory``)."""
-    from soup_cli.utils.profiler import GPU_MEMORY
+    from soup_cli.utils.profiler import GPU_MEMORY, normalize_gpu_name
 
     if gpu is not None:
-        gpu_key = gpu.lower().replace(" ", "").replace("-", "")
+        gpu_key = normalize_gpu_name(gpu)
         if gpu_key not in GPU_MEMORY:
             raise McpToolError("unknown gpu (see 'soup profile --help' for valid options)")
         return float(GPU_MEMORY[gpu_key])

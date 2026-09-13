@@ -15,6 +15,7 @@ from soup_cli.utils.profiler import (
     GPU_MEMORY,
     estimate_speed,
     estimate_total,
+    normalize_gpu_name,
     recommend_batch_size,
     recommend_gpu,
 )
@@ -74,8 +75,9 @@ def profile(
     )
 
     # Speed estimates
+    effective_gpu = gpu if gpu is not None else getattr(gpu_memory_gb, "device_name", None)
     tokens_per_sec = estimate_speed(
-        model_params_b, cfg.training.quantization, batch_size
+        model_params_b, cfg.training.quantization, batch_size, gpu=effective_gpu
     )
     samples_per_sec = tokens_per_sec / max(cfg.data.max_length, 1)
 
@@ -99,18 +101,36 @@ def profile(
     _render_profile(result, cfg, gpu_memory_gb)
 
 
-def _resolve_gpu_memory(gpu: str | None) -> float:
+class GpuMemory(float):
+    """Float representing GPU memory in GB with provenance metadata."""
+
+    is_assumed: bool = False
+    device_name: str | None = None
+
+    def __new__(
+        cls,
+        val: float,
+        is_assumed: bool = False,
+        device_name: str | None = None,
+    ):
+        obj = super().__new__(cls, val)
+        obj.is_assumed = is_assumed
+        obj.device_name = device_name
+        return obj
+
+
+def _resolve_gpu_memory(gpu: str | None) -> GpuMemory:
     """Resolve GPU memory in GB from flag or auto-detection."""
     if gpu is not None:
-        gpu_key = gpu.lower().replace(" ", "").replace("-", "")
+        gpu_key = normalize_gpu_name(gpu)
         if gpu_key not in GPU_MEMORY:
-            valid = ", ".join(sorted(GPU_MEMORY.keys()))
+            valid = ", ".join(sorted(set(GPU_MEMORY.keys())))
             console.print(
                 f"[red]Unknown GPU:[/] {gpu}\n"
                 f"[dim]Valid options: {valid}[/]"
             )
             raise typer.Exit(1)
-        return float(GPU_MEMORY[gpu_key])
+        return GpuMemory(float(GPU_MEMORY[gpu_key]), is_assumed=False, device_name=gpu_key)
 
     # Auto-detect
     try:
@@ -119,12 +139,21 @@ def _resolve_gpu_memory(gpu: str | None) -> float:
         info = get_gpu_info()
         mem_bytes = info.get("memory_total_bytes", 0)
         if mem_bytes > 0:
-            return mem_bytes / (1024**3)
+            dev_name = info.get("device_name")
+            if not dev_name:
+                try:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        dev_name = torch.cuda.get_device_name(0)
+                except (ImportError, Exception):
+                    pass
+            return GpuMemory(mem_bytes / (1024**3), is_assumed=False, device_name=dev_name)
     except (ImportError, RuntimeError, OSError):
         pass
 
     # Default to 24 GB (common consumer GPU)
-    return 24.0
+    return GpuMemory(24.0, is_assumed=True, device_name=None)
 
 
 def _render_profile(result: dict, cfg, gpu_memory_gb: float) -> None:
@@ -163,15 +192,26 @@ def _render_profile(result: dict, cfg, gpu_memory_gb: float) -> None:
     # Recommendations
     recs = []
     fits = result["total_memory_gb"] <= gpu_memory_gb
-    if fits:
-        recs.append(
-            f"[green]OK[/] Fits in {gpu_memory_gb:.0f} GB VRAM"
-        )
+    is_assumed = getattr(gpu_memory_gb, "is_assumed", False)
+    if is_assumed:
+        if fits:
+            recs.append(
+                f"[yellow]?[/] Assuming 24 GB (no GPU detected; pass --gpu) -- fits estimated ~{result['total_memory_gb']:.1f} GB"
+            )
+        else:
+            recs.append(
+                f"[red]X[/] Assuming 24 GB (no GPU detected; pass --gpu) -- does NOT fit (need ~{result['total_memory_gb']:.1f} GB)"
+            )
     else:
-        recs.append(
-            f"[red]X[/] Does NOT fit in {gpu_memory_gb:.0f} GB VRAM "
-            f"(need ~{result['total_memory_gb']:.0f} GB)"
-        )
+        if fits:
+            recs.append(
+                f"[green]OK[/] Fits in {gpu_memory_gb:.0f} GB VRAM"
+            )
+        else:
+            recs.append(
+                f"[red]X[/] Does NOT fit in {gpu_memory_gb:.0f} GB VRAM "
+                f"(need ~{result['total_memory_gb']:.0f} GB)"
+            )
 
     recs.append(
         f"[green]OK[/] Recommended batch_size: {result['recommended_batch_size']}"

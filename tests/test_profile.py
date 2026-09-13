@@ -573,6 +573,61 @@ class TestResolveGpuMemory:
         )
         mem = _resolve_gpu_memory(None)
         assert mem == 24.0
+        assert getattr(mem, "is_assumed", False) is True
+
+
+class TestIssue830GpuProfileDefects:
+    """Test suite addressing issue #830: GPU lookup, speed scaling, and unmeasured 24GB fallback."""
+
+    def test_issue830_gpu_lookup_and_variants(self):
+        """--gpu rtx3050, rtx5070, 'rtx 5070 laptop', and b200 are accepted with correct memory."""
+        from soup_cli.commands.profile import _resolve_gpu_memory
+
+        assert _resolve_gpu_memory("rtx3050") == 8.0
+        assert _resolve_gpu_memory("rtx5070") == 12.0
+        assert _resolve_gpu_memory("rtx 5070 laptop") == 8.0
+        assert _resolve_gpu_memory("NVIDIA GeForce RTX 5070 Laptop GPU") == 8.0
+        assert _resolve_gpu_memory("b200") == 192.0
+        assert _resolve_gpu_memory("rtx5080") == 16.0
+
+    def test_issue830_estimate_speed_gpu_scaling(self):
+        """estimate_speed returns different values for t4 and h100 on the same config."""
+        from soup_cli.utils.profiler import estimate_speed
+
+        speed_t4 = estimate_speed(7.0, "4bit", 4, gpu="t4")
+        speed_h100 = estimate_speed(7.0, "4bit", 4, gpu="h100")
+        speed_default = estimate_speed(7.0, "4bit", 4)
+
+        assert speed_t4 != speed_h100
+        assert speed_t4 < speed_default < speed_h100
+
+    def test_issue830_no_gpu_detected_profile_warning(self, tmp_path, monkeypatch):
+        """When get_gpu_info reports no device, output does not present 'Fits in 24 GB' as measured."""
+        monkeypatch.setattr(
+            "soup_cli.utils.gpu.get_gpu_info",
+            lambda: {"memory_total": "0 GB", "memory_total_bytes": 0, "gpu_count": 0},
+        )
+        config_file = tmp_path / "soup.yaml"
+        config_file.write_text(
+            "base: meta-llama/Llama-3.1-8B-Instruct\n"
+            "task: sft\n"
+            "data:\n"
+            "  train: ./data/train.jsonl\n"
+            "  max_length: 2048\n"
+            "training:\n"
+            "  batch_size: 4\n"
+            "  quantization: 4bit\n"
+            "  lora:\n"
+            "    r: 64\n"
+            "output: ./output\n"
+        )
+        result = runner.invoke(app, ["profile", "--config", str(config_file)])
+        assert result.exit_code == 0
+        assert "OK Fits in 24 GB VRAM" not in result.output
+        assert "Assuming 24 GB" in result.output
+        assert "no GPU detected" in result.output
+        assert "pass --gpu" in result.output
+
 
 
 class TestTrainableParamsEstimate:

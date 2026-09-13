@@ -1,34 +1,134 @@
 """Training profile estimator — memory, speed, and recommendations."""
 
 import math
+import re
+
+
+def normalize_gpu_name(name: str) -> str:
+    """Normalize user input or torch device string to canonical lookup key."""
+    s = name.lower()
+    # Strip common vendor, branding and bus prefixes/suffixes
+    s = re.sub(r"\b(nvidia|geforce|gpu|sxm\d*|pcie|hbm\d*)\b", "", s)
+    # Collapse whitespace, dashes, underscores
+    s = re.sub(r"[\s\-_]+", "", s)
+    return s
+
 
 # GPU memory lookup table (name → GB VRAM)
 GPU_MEMORY: dict[str, int] = {
+    # RTX 30-series
+    "rtx3050": 8,
+    "rtx30508gb": 8,
+    "rtx30506gb": 6,
+    "rtx3050laptop": 4,
     "rtx3060": 12,
+    "rtx3060laptop": 6,
     "rtx3070": 8,
     "rtx3070ti": 8,
+    "rtx3070laptop": 8,
     "rtx3080": 10,
     "rtx3080ti": 12,
+    "rtx3080laptop": 16,
     "rtx3090": 24,
+    # RTX 40-series
+    "rtx4050laptop": 6,
     "rtx4060": 8,
     "rtx4060ti": 16,
+    "rtx4060laptop": 8,
     "rtx4070": 12,
     "rtx4070ti": 12,
+    "rtx4070laptop": 8,
     "rtx4080": 16,
+    "rtx4080laptop": 12,
     "rtx4090": 24,
+    "rtx4090laptop": 16,
+    # RTX 50-series (Blackwell consumer)
+    "rtx5060": 8,
+    "rtx5060ti": 16,
+    "rtx5060laptop": 8,
+    "rtx5070": 12,
+    "rtx5070ti": 16,
+    "rtx5070laptop": 8,
+    "rtx5080": 16,
+    "rtx5080laptop": 16,
     "rtx5090": 32,
+    "rtx5090laptop": 24,
+    # Datacenter & Enterprise
     "a10": 24,
     "a30": 24,
     "a40": 48,
     "a100": 80,
     "a100_40gb": 40,
+    "a10040gb": 40,
+    "a10080gb": 80,
     "h100": 80,
     "h200": 141,
+    "b200": 192,
+    "gb200": 192,
     "l4": 24,
     "l40": 48,
     "l40s": 48,
     "t4": 16,
     "v100": 32,
+}
+
+# Relative throughput multiplier compared to A100 (1.0)
+GPU_SPEED_MULT: dict[str, float] = {
+    # Blackwell & Hopper datacenter
+    "gb200": 4.5,
+    "b200": 4.0,
+    "h200": 2.8,
+    "h100": 2.5,
+    # Ampere / Ada / Volta datacenter
+    "a100": 1.0,
+    "a100_40gb": 1.0,
+    "a10040gb": 1.0,
+    "a10080gb": 1.0,
+    "l40s": 0.8,
+    "l40": 0.7,
+    "a40": 0.6,
+    "a30": 0.5,
+    "a10": 0.4,
+    "v100": 0.4,
+    "l4": 0.35,
+    "t4": 0.2,
+    # RTX 50-series
+    "rtx5090": 1.2,
+    "rtx5090laptop": 0.9,
+    "rtx5080": 0.9,
+    "rtx5080laptop": 0.7,
+    "rtx5070ti": 0.75,
+    "rtx5070": 0.6,
+    "rtx5070laptop": 0.45,
+    "rtx5060ti": 0.5,
+    "rtx5060": 0.4,
+    "rtx5060laptop": 0.3,
+    # RTX 40-series
+    "rtx4090": 0.7,
+    "rtx4090laptop": 0.5,
+    "rtx4080": 0.55,
+    "rtx4080laptop": 0.4,
+    "rtx4070ti": 0.5,
+    "rtx4070": 0.45,
+    "rtx4070laptop": 0.35,
+    "rtx4060ti": 0.35,
+    "rtx4060": 0.3,
+    "rtx4060laptop": 0.25,
+    "rtx4050laptop": 0.2,
+    # RTX 30-series
+    "rtx3090": 0.45,
+    "rtx3080ti": 0.42,
+    "rtx3080": 0.4,
+    "rtx3080laptop": 0.3,
+    "rtx3070ti": 0.32,
+    "rtx3070": 0.3,
+    "rtx3070laptop": 0.25,
+    "rtx3060": 0.25,
+    "rtx3060laptop": 0.2,
+    "rtx3050": 0.15,
+    "rtx30508gb": 0.15,
+    "rtx30506gb": 0.12,
+    "rtx3050laptop": 0.1,
 }
 
 # Known model architectures: model_size_b → (hidden_size, num_layers, intermediate_size)
@@ -220,11 +320,15 @@ def estimate_total(
 
 
 def estimate_speed(
-    model_params_b: float, quantization: str, batch_size: int
+    model_params_b: float,
+    quantization: str,
+    batch_size: int,
+    gpu: str | None = None,
 ) -> float:
     """Estimate training tokens/sec (rough lookup-based).
 
-    Based on typical A100 throughput for different model sizes.
+    Based on typical A100 throughput for different model sizes, scaled
+    by per-GPU relative throughput when a target GPU is specified.
     """
     # Base tokens/sec on A100 for different sizes (4bit, batch=4)
     base_speed: dict[float, float] = {
@@ -252,6 +356,11 @@ def estimate_speed(
 
     # Adjust for batch size (relative to base batch=4)
     speed *= min(batch_size / 4, 2.0)  # diminishing returns above 8
+
+    # Adjust for GPU relative throughput if specified
+    if gpu:
+        norm_gpu = normalize_gpu_name(gpu)
+        speed *= GPU_SPEED_MULT.get(norm_gpu, 1.0)
 
     return speed
 
@@ -297,10 +406,16 @@ def recommend_gpu(total_memory_gb: float) -> list[str]:
 
     Returns list of GPU names that have enough VRAM.
     """
+    seen = set()
     compatible = []
     for name, vram in sorted(GPU_MEMORY.items(), key=lambda item: item[1]):
-        if vram >= total_memory_gb * 1.1:  # 10% headroom
-            compatible.append(f"{name.upper()} ({vram} GB)")
+        # Skip aliases with explicit size/underscore suffixes for clean display
+        if "_" in name or (len(name) > 4 and name.endswith("gb")):
+            continue
+        display_name = f"{name.upper()} ({vram} GB)"
+        if display_name not in seen and vram >= total_memory_gb * 1.1:  # 10% headroom
+            seen.add(display_name)
+            compatible.append(display_name)
 
     if not compatible:
         compatible.append(
