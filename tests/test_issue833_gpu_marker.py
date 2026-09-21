@@ -194,3 +194,109 @@ class TestTheHook:
 
     def test_the_probe_is_a_bool(self):
         assert isinstance(conftest.cuda_available(), bool)
+
+
+class TestDeviceCountGating:
+    """The gpu marker must gate on initial visible device count > 0 (#1128).
+
+    Under CUDA_VISIBLE_DEVICES="", PyTorch may report device_count() == 0 pre-init
+    but report 1 if a CUDA tensor is allocated post-init. Pinning the count at
+    session start in conftest keeps the gpu marker deterministic across the suite,
+    while leaving exported conftest.cuda_available() answering is_available() so
+    other test callers do not regress.
+    """
+
+    def test_probe_initial_device_count_returns_zero_when_no_device_visible(
+        self, monkeypatch
+    ):
+        """Under CUDA_VISIBLE_DEVICES='', is_available is True but device_count is 0."""
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+
+        assert conftest._probe_initial_device_count() == 0
+
+    def test_probe_initial_device_count_returns_count_when_device_visible(
+        self, monkeypatch
+    ):
+        """When device is visible, probe returns positive count."""
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+        assert conftest._probe_initial_device_count() == 1
+
+    def test_probe_initial_device_count_fails_safe_on_exception(self, monkeypatch):
+        """Broken driver or torch import error returns 0 safely."""
+        import torch
+
+        def _boom():
+            raise RuntimeError("CUDA initialization error")
+
+        monkeypatch.setattr(torch.cuda, "is_available", _boom)
+        assert conftest._probe_initial_device_count() == 0
+
+    def test_predicate_returns_false_when_initial_device_count_is_zero(
+        self, monkeypatch
+    ):
+        """_cuda_device_available() returns False when initial count is 0."""
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 0)
+
+        assert conftest._cuda_device_available() is False
+
+    def test_predicate_returns_true_when_device_is_available_and_visible(
+        self, monkeypatch
+    ):
+        """Prove both directions: when card was visible at start, probe returns True."""
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 1)
+
+        assert conftest._cuda_device_available() is True
+
+    def test_predicate_returns_false_when_torch_cuda_not_available(self, monkeypatch):
+        """When is_available() is False, probe returns False even if count were positive."""
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 1)
+
+        assert conftest._cuda_device_available() is False
+
+    def test_exported_cuda_available_answers_is_available(self, monkeypatch):
+        """Exported cuda_available() continues answering is_available() (#1128 review)."""
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 0)
+
+        conftest.cuda_available.cache_clear()
+        try:
+            assert conftest.cuda_available() is True
+        finally:
+            conftest.cuda_available.cache_clear()
+
+    def test_gpu_test_skips_when_initial_device_count_is_zero(self, monkeypatch):
+        """End-to-end hook check: zero visible devices causes the gpu test to skip (#1128)."""
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 0)
+
+        with pytest.raises(pytest.skip.Exception, match="needs a CUDA device"):
+            conftest.pytest_runtest_setup(_item(pytest.mark.gpu.mark))
+
+    def test_gpu_test_runs_when_initial_device_count_is_positive(self, monkeypatch):
+        """End-to-end hook check: positive visible devices allows test to run (#1128)."""
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 1)
+
+        conftest.pytest_runtest_setup(_item(pytest.mark.gpu.mark))

@@ -11,6 +11,43 @@ import pytest
 GPU_SKIP_REASON = "needs a CUDA device (run the GPU subset with: pytest -m gpu --no-cov)"
 
 
+def _probe_initial_device_count() -> int:
+    """Probe the visible CUDA device count before any test initialises CUDA (#1128).
+
+    Under CUDA_VISIBLE_DEVICES="", PyTorch may report device_count() == 0 pre-init
+    but report 1 if a CUDA tensor is allocated post-init. Pinning the pre-init
+    count at session start keeps the gpu marker deterministic across the suite.
+    """
+    try:
+        import torch
+    except Exception:
+        return 0
+    try:
+        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:  # noqa: BLE001 — broken CUDA install or driver
+        return 0
+
+
+_INITIAL_CUDA_DEVICE_COUNT: int = _probe_initial_device_count()
+
+
+def _cuda_device_available() -> bool:
+    """Check if a usable CUDA device was visible at session start (#1128).
+
+    Checking is_available() alone fails open when PyTorch is built with CUDA but
+    no device is exposed (e.g. under CUDA_VISIBLE_DEVICES=""), causing gpu-marked
+    tests to run and crash instead of skipping.
+    """
+    try:
+        import torch
+    except Exception:
+        return False
+    try:
+        return bool(torch.cuda.is_available() and _INITIAL_CUDA_DEVICE_COUNT > 0)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @functools.lru_cache(maxsize=None)
 def cuda_available() -> bool:
     """THE one CUDA probe for the test suite (#833). Probed once per session.
@@ -33,7 +70,7 @@ def cuda_available() -> bool:
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
     marker = item.get_closest_marker("gpu")
-    if marker is not None and not cuda_available():
+    if marker is not None and not _cuda_device_available():
         why = marker.kwargs.get("reason")
         pytest.skip(f"{GPU_SKIP_REASON}: {why}" if why else GPU_SKIP_REASON)
 
