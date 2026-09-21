@@ -237,10 +237,9 @@ class TestLoadModel:
         adapter_config = tmp_path / "adapter_config.json"
         adapter_config.write_text(json.dumps({"peft_type": "LORA"}))
 
-        import typer
         from click.exceptions import Exit
 
-        with pytest.raises((Exit, typer.Exit)):
+        with pytest.raises(Exit):
             _load_model(str(tmp_path), None, "cpu")
 
     def test_adapter_with_corrupt_json_exits(self, tmp_path):
@@ -250,10 +249,9 @@ class TestLoadModel:
         adapter_config = tmp_path / "adapter_config.json"
         adapter_config.write_text("not valid json {{{")
 
-        import typer
         from click.exceptions import Exit
 
-        with pytest.raises((Exit, typer.Exit)):
+        with pytest.raises(Exit):
             _load_model(str(tmp_path), None, "cpu")
 
     def test_adapter_config_reads_base_model(self, tmp_path):
@@ -477,6 +475,40 @@ class TestInferHFRepoId:
         assert passed_model_path == "HuggingFaceTB/SmolLM2-135M-Instruct"
         assert "\\" not in passed_model_path
         assert "/" in passed_model_path
+        assert mock_load.call_args.kwargs.get("is_local") is False
+
+    def test_cli_passes_is_local_true_for_local_dir(self, tmp_path, monkeypatch):
+        """soup infer --model <local_dir> passes is_local=True to _load_model (#1097 / #1118)."""
+        from unittest.mock import MagicMock, patch
+
+        from typer.testing import CliRunner
+
+        from soup_cli.cli import app
+
+        model_dir = tmp_path / "my_model"
+        model_dir.mkdir()
+        prompts_file = tmp_path / "prompts.jsonl"
+        prompts_file.write_text(json.dumps({"prompt": "test"}) + "\n")
+
+        mock_load = MagicMock()
+        mock_model = MagicMock()
+        mock_tok = MagicMock()
+        mock_load.return_value = (mock_model, mock_tok)
+
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        with patch("soup_cli.commands.infer._load_model", mock_load), \
+             patch("soup_cli.commands.infer._generate", return_value=("answer", 5)):
+            result = runner.invoke(app, [
+                "infer",
+                "--model", str(model_dir),
+                "--input", str(prompts_file),
+                "--output", "out.jsonl",
+            ])
+
+        assert result.exit_code == 0, result.output
+        mock_load.assert_called_once()
+        assert mock_load.call_args.kwargs.get("is_local") is True
 
     def test_load_model_hf_repo_id_passes_slash_to_transformers(self):
         """_load_model must pass the HF repo id unmodified to transformers (#1097)."""

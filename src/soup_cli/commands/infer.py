@@ -206,9 +206,7 @@ def infer(
         console.print(
             f"[dim]Local path not found; treating {model_ref!r} as a HF repo id.[/]"
         )
-        model_target = model_ref
-    else:
-        model_target = str(Path(model_ref))
+    model_target = model_ref
 
     # Read prompts
     prompts = _read_prompts(input_path)
