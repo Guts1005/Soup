@@ -53,6 +53,8 @@ _MAX_UNFROZEN_PATTERN_LEN = 512
 # ``attach_lisa_callback``. Adding a task to this tuple without that wiring
 # would accept a config the trainer silently ignores.
 _LISA_SUPPORTED_TASKS = ("sft", "pretrain")
+# #725 — tasks whose transformers trainer wires attach_lorafa_optimizer.
+_LORAFA_SUPPORTED_TASKS = ("sft", "pretrain", "embedding")
 
 
 class LoraConfig(BaseModel):
@@ -2813,6 +2815,14 @@ class TrainingConfig(BaseModel):
         gt=0,
         description="LoRA+ lr ratio: lr_B = lr × ratio. None = disabled (standard LoRA).",
     )
+    # LoRA-FA — freeze LoRA A matrices and train B matrices to reduce activation memory
+    use_lorafa: bool = Field(
+        default=False,
+        description=(
+            "Enable LoRA-FA (Frozen-A LoRA) optimizer: freezes LoRA A matrices "
+            "to reduce activation memory"
+        ),
+    )
     # GaLore — memory-efficient full-parameter training
     use_galore: bool = Field(
         default=False,
@@ -3914,6 +3924,41 @@ class TrainingConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_lorafa_compat(self) -> "TrainingConfig":
+        """#725 — LoRA-FA mutual exclusion with LoRA+, GaLore, and VeRA."""
+        if self.use_lorafa and self.loraplus_lr_ratio is not None:
+            raise ValueError(
+                "training.use_lorafa and training.loraplus_lr_ratio are mutually exclusive: "
+                "LoRA-FA freezes LoRA A matrices while LoRA+ tunes them with separate learning "
+                "rates. Enable one, not both."
+            )
+        if self.use_lorafa and self.use_galore:
+            raise ValueError(
+                "training.use_lorafa and training.use_galore are mutually exclusive: "
+                "LoRA-FA tunes LoRA B matrices while GaLore projects full-parameter gradients. "
+                "Enable one, not both."
+            )
+        if self.use_lorafa and getattr(self.lora, "use_vera", False):
+            raise ValueError(
+                "training.use_lorafa and training.lora.use_vera are mutually exclusive: "
+                "VeRA freezes random projection matrices and trains scaling vectors, "
+                "so peft's create_lorafa_optimizer finds no trainable lora_* matrices "
+                "and silently degrades to plain AdamW."
+            )
+        if self.use_lorafa and self.optimizer is not None and self.optimizer not in (
+            "adamw_torch",
+            "adamw",
+            "adamw_hf",
+            "adamw_torch_fused",
+        ):
+            raise ValueError(
+                f"training.use_lorafa uses an AdamW-based gradient projection and is "
+                f"incompatible with training.optimizer={self.optimizer!r}. Leave optimizer "
+                f"unset (defaulting to adamw) or use 'adamw_torch'."
+            )
+        return self
+
     # ---- v0.61.0 Part A — Unlearning ---------------------------------------
     # Schema-only release: validators here are reused by the SoupConfig
     # cross-validator + UnlearnTrainerWrapper. Live trainer in v0.61.1.
@@ -4395,6 +4440,15 @@ _QUANTIZATION_UNHONOURED_TASKS = frozenset({
     "moe_lora_routing", "unlearn", "asr",
 })
 
+#: #798 — the tasks whose trainers actually read each MoE flag, mapped from the
+#: readers rather than from the docs: ``moe_expert_quant`` and
+#: ``train_router_only`` are applied only by ``trainer/sft.py`` (``tts`` inherits
+#: its setup through ``super()``), and ``moe_aux_loss_coeff`` is read by
+#: ``sft.py`` and ``pretrain.py``. Everywhere else the field was accepted and
+#: never applied.
+_MOE_EXPERT_KNOB_TASKS = frozenset({"sft", "tts"})
+_MOE_AUX_LOSS_TASKS = frozenset({"sft", "tts", "pretrain"})
+
 #: The bitsandbytes values: ``4bit`` was the default, so every config Soup dumped
 #: for these tasks carries one of them literally (#795 review).
 _BNB_QUANTIZATION_VALUES = frozenset({"4bit", "8bit"})
@@ -4639,6 +4693,10 @@ class SoupConfig(BaseModel):
             offenders.append('quantization_aware="fp8"')
         if tcfg.activation_offloading is not None:
             offenders.append("activation_offloading")
+        if tcfg.fp8_attention and self.backend != "mlx":
+            offenders.append("fp8_attention")
+        if tcfg.nvfp4 and self.backend != "mlx":
+            offenders.append("nvfp4")
         if not offenders:
             return self
         # Distinct reasons get distinct messages so users don't waste time
@@ -5201,6 +5259,46 @@ class SoupConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _validate_moe_flags_reach_a_trainer(self) -> "SoupConfig":
+        """#798 — refuse MoE flags on tasks whose trainer never reads them.
+
+        ``moe_expert_quant`` and ``train_router_only`` are applied in
+        ``trainer/sft.py`` only; ``moe_aux_loss_coeff`` in ``sft.py`` and
+        ``pretrain.py``. On every other task they were accepted, stored in the
+        run's config, and silently not applied -- the defect class this release
+        cycle spent its time removing. (The version is deliberately not spelled
+        out here: ``config/unknown_keys.py`` is the one file allowed to hold it,
+        and ``test_issue627...::test_the_version_is_written_out_in_exactly_one_source_file``
+        fails on a second copy.)
+
+        ``moe_aux_loss_coeff``'s default is ``0.01``, and a dumped config writes
+        it out, so only a NON-DEFAULT value is refused: refusing the default
+        would break every stored config and the eleven shipped recipes that
+        write it explicitly.
+        """
+        tcfg = self.training
+        if self.task not in _MOE_EXPERT_KNOB_TASKS:
+            for field in ("moe_expert_quant", "train_router_only"):
+                value = getattr(tcfg, field, None)
+                if value:
+                    raise ValueError(
+                        f"training.{field} is not applied by task={self.task!r}: "
+                        f"only {sorted(_MOE_EXPERT_KNOB_TASKS)} read it "
+                        f"(trainer/sft.py), so it would be stored and never take "
+                        f"effect. Remove it, or use one of those tasks."
+                    )
+        if self.task not in _MOE_AUX_LOSS_TASKS:
+            default = type(tcfg).model_fields["moe_aux_loss_coeff"].default
+            if tcfg.moe_aux_loss_coeff != default:
+                raise ValueError(
+                    f"training.moe_aux_loss_coeff={tcfg.moe_aux_loss_coeff!r} is "
+                    f"not applied by task={self.task!r}: only "
+                    f"{sorted(_MOE_AUX_LOSS_TASKS)} read it (sft.py, "
+                    f"pretrain.py). Remove it, or use one of those tasks."
+                )
+        return self
+
+    @model_validator(mode="after")
     def _validate_moe_expert_quant_compat(self) -> "SoupConfig":
         """v0.52.0 Part F — ``moe_expert_quant`` + ``train_router_only`` gates."""
         tcfg = self.training
@@ -5297,6 +5395,8 @@ class SoupConfig(BaseModel):
             lora_conflicts.append("relora_steps")
         if tcfg.loraplus_lr_ratio is not None:
             lora_conflicts.append("loraplus_lr_ratio")
+        if tcfg.use_lorafa:
+            lora_conflicts.append("use_lorafa")
         if lora_conflicts:
             raise ValueError(
                 f"training.unfrozen_parameters (Spectrum full fine-tuning, "
@@ -5396,11 +5496,30 @@ class SoupConfig(BaseModel):
             lora_conflicts.append("relora_steps")
         if tcfg.loraplus_lr_ratio is not None:
             lora_conflicts.append("loraplus_lr_ratio")
+        if tcfg.use_lorafa:
+            lora_conflicts.append("use_lorafa")
         if lora_conflicts:
             raise ValueError(
                 f"training.lisa_enabled (LISA full fine-tuning, LoRA off) is "
                 f"mutually exclusive with LoRA features: "
                 f"{', '.join(lora_conflicts)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_lorafa_task_and_backend(self) -> "SoupConfig":
+        """#725 — LoRA-FA task and backend gating."""
+        if not self.training.use_lorafa:
+            return self
+        if self.backend != "transformers":
+            raise ValueError(
+                f"training.use_lorafa requires backend='transformers'; "
+                f"got backend={self.backend!r}"
+            )
+        if self.task not in _LORAFA_SUPPORTED_TASKS:
+            raise ValueError(
+                f"training.use_lorafa (LoRA-FA optimizer) is currently only supported for tasks "
+                f"{', '.join(sorted(_LORAFA_SUPPORTED_TASKS))}; got task={self.task!r}"
             )
         return self
 
@@ -5488,6 +5607,8 @@ class SoupConfig(BaseModel):
             lora_conflicts.append("relora_steps")
         if tcfg.loraplus_lr_ratio is not None:
             lora_conflicts.append("loraplus_lr_ratio")
+        if tcfg.use_lorafa:
+            lora_conflicts.append("use_lorafa")
         if lora_conflicts:
             raise ValueError(
                 f"training.lora.r=0 means full fine-tuning (no adapter), so it "
@@ -6966,9 +7087,11 @@ class SoupConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_callback_monitoring_task_compat(self) -> "SoupConfig":
-        """#802 — prm, moe_lora_routing, and unlearn attach no
-        SoupTrainerCallback, so reject loss_watchdog, loss_spike_recovery,
-        and grad_accum_auto_tune when set to True on these tasks.
+        """#802, #1069 — prm, moe_lora_routing, and unlearn attach no
+        SoupTrainerCallback, and on backend=mlx the callback has no stop control,
+        no checkpoint-rollback path, and no VRAM budget, so reject loss_watchdog,
+        loss_spike_recovery, and grad_accum_auto_tune when set to True on these
+        tasks or on backend=mlx.
         """
         unsupported = ("prm", "moe_lora_routing", "unlearn")
         if self.task in unsupported:
@@ -6987,6 +7110,25 @@ class SoupConfig(BaseModel):
                 raise ValueError(
                     f"training.grad_accum_auto_tune is not supported for task={self.task!r} "
                     f"because {self.task!r} does not attach a live training callback"
+                )
+        if self.backend == "mlx":
+            tcfg = self.training
+            if getattr(tcfg, "loss_spike_recovery", False):
+                raise ValueError(
+                    f"training.loss_spike_recovery is not supported for backend={self.backend!r} "
+                    "because spike recovery is driven by the watchdog and the watchdog "
+                    "cannot fire on MLX"
+                )
+            if getattr(tcfg, "loss_watchdog", False):
+                raise ValueError(
+                    f"training.loss_watchdog is not supported for backend={self.backend!r} "
+                    "because Soup does not implement the watchdog on the MLX callback, "
+                    "which has no stop control"
+                )
+            if getattr(tcfg, "grad_accum_auto_tune", False):
+                raise ValueError(
+                    f"training.grad_accum_auto_tune is not supported for backend={self.backend!r} "
+                    "because there is no VRAM total to measure pressure against on unified memory"
                 )
         return self
 
@@ -7338,6 +7480,10 @@ training:
     r: 64
     alpha: 16
     target_modules: auto
+    # peft adapts fused expert parameters through a ParamWrapper, which refuses a
+    # non-zero dropout, so moe_lora: true and the 0.05 default cannot both hold
+    # (#798). Every shipped MoE recipe pins this line for the same reason.
+    dropout: 0.0
   quantization: 4bit
   moe_lora: true
   moe_aux_loss_coeff: 0.01

@@ -332,6 +332,26 @@ training:
 ```
 
 
+## LoRA-FA (Frozen-A LoRA)
+
+Freeze random projection matrices in LoRA $A$ and update only LoRA $B$ matrices using PEFT's `create_lorafa_optimizer` ([arXiv:2308.03303](https://arxiv.org/abs/2308.03303)):
+
+```yaml
+training:
+  lr: 2e-4
+  use_lorafa: true
+  lora:
+    r: 64
+    alpha: 16
+```
+
+### Operating Point & Caveats
+- **Measured Adapter Operating Point:** Trains exactly 50.0% fewer parameters per adapted projection (trains $B$, freezes $A$), reducing AdamW optimizer states (`exp_avg_B`, `exp_avg_sq_B`) by half for square projections.
+- **Analytic Activation Retention:** Freezing $A$ avoids storing input activations $x \in \mathbb{R}^{B \times L \times d_{in}}$ for adapter backpropagation through $A$. Only $u = A x \in \mathbb{R}^{B \times L \times r}$ is retained, yielding an analytic adapter activation ratio of $r / d_{in}$ (~64× reduction for rank 64 on hidden dim 4096; the exact ratio scales with your rank choice).
+- **Scope & Limitations:** These values represent a micro-benchmark operating point and an analytic saved-tensor ratio for the adapter projections — **they are not total or peak LLM VRAM savings, an end-to-end throughput result, or a quality claim.** Peak training VRAM in full LLM fine-tuning is dominated by base model activations, KV caches, and weights; total end-to-end VRAM savings are substantially smaller. Downstream task quality and end-to-end throughput vs standard LoRA remain unmeasured. See [`benchmarks/gate-725-lorafa-operating-point.md`](../benchmarks/gate-725-lorafa-operating-point.md) for measured figures.
+- **Compatibility:** Supported on the `transformers` backend for `sft`, `pretrain`, and `embedding` tasks. Mutually exclusive with `loraplus_lr_ratio` (which differentiates $A$ and $B$ rates), `use_galore`, `lora.use_vera` (VeRA trains scaling vectors, so `create_lorafa_optimizer` finds no $B$ matrices), non-AdamW optimizers, and the `mlx` backend. Requires explicit `lora.r` and `lora.alpha`. LoRA-FA has not been validated under `stream_layers: true` (layer streaming); combining them is not recommended.
+
+
 ## rsLoRA (Rank-Stabilized Scaling)
 
 Use rank-stabilized LoRA scaling for better performance at high ranks:
@@ -529,6 +549,7 @@ training:
   loss_watchdog_patience: 5     # Consecutive steps above threshold before stopping
 ```
 
+> **Backend Note:** Setting `loss_watchdog: true` is refused on `backend: mlx` at config validation (Soup does not implement the watchdog on the MLX callback, which has no stop control).
 
 ## Training Stability & Auto-Tuning
 
@@ -580,6 +601,8 @@ training:
   loss_spike_recovery_lr_decay: 0.5     # halve LR each recovery
 ```
 
+> **Backend Note:** Setting `loss_spike_recovery: true` is refused on `backend: mlx` at config validation (spike recovery is driven by the watchdog and the watchdog cannot fire on MLX).
+
 ### Convergence Detector
 
 ```yaml
@@ -602,6 +625,8 @@ training:
 ```
 
 Records peak memory each step. When pressure crosses the threshold, recommends a new `(batch, accum)` pair preserving effective batch (capped at `accum=1024`).
+
+> **Backend Note:** Setting `grad_accum_auto_tune: true` is refused on `backend: mlx` at config validation (there is no VRAM total to measure pressure against on unified memory).
 
 > **v0.33.0:** `--find-lr` now runs an in-process LR-sweep training loop (replaces the v0.32.0 stub curve), spike-recovery writes a `spike_recovery.json` hint with the decayed LR for re-launch, and the grad-accum advisory prints a recommended `(batch, accum)` pair when VRAM pressure crosses the threshold. Live optimizer-state rewind and live DataLoader rebuild remain follow-ups (HF Trainer / TRL upstream constraints).
 

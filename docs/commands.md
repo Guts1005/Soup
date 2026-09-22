@@ -323,7 +323,7 @@ soup adapters branch <name> --from-registry <id> | --attach-to-registry <id>  Br
 soup adapters bisect <ckpt>... --eval-command "..."  Binary search over training history (v0.67.0)
 soup lock write --base-sha <h> --dataset-sha <h> --env-hash <h>  Write soup.lock (v0.67.0)
 soup lock write --base-sha <h> --dataset-sha <h> --env-lock soup-env.lock  Auto-derive --env-hash from soup-env.lock (v0.71.1)
-soup lock show / soup lock check              Show + drift-check (exit 3 on drift)
+soup lock show / soup lock check              Show + drift-check (exit 2 on drift, 3 on usage/missing lock)
 soup compile <program.py> --eval <suite> [--optimizer mipro|gepa|textgrad|copro|bootstrap_fewshot] [--plan-only]  DSPy / GEPA / TextGrad prompt-program compiler — live (v0.71.13; pip install "soup-cli[compile]")
 soup distill-prompt --traces <jsonl> --teacher <m> --student <m> --strategy sft|preference|kl [--provider ollama|anthropic|vllm] [--base-url <url>] [--temperature F] [--max-rows N]  Distill prompt-heavy traces via a live teacher (v0.71.13)
 soup compile-tools <spec.json|yaml> --eval <jsonl> [--optimizer textgrad|gepa] [--plan-only]  TextGrad / GEPA tool-schema optimiser — live (v0.71.13; pip install "soup-cli[compile]")
@@ -346,17 +346,17 @@ soup data brain-rot <data.jsonl> [--strict]   Brain-rot detector — arXiv 2510.
 soup iterative-dpo --base-model <m> --reward-model <rm> --prompts <p.jsonl> --output-dir <out> --rounds N --pairs-per-round N [--plan-only]  Iterative DPO loop driver — LIVE sample→score→pair→train (v0.70.0; live v0.71.11)
 soup train --reward-hack-detector info_rm|rm_ensemble [--reward-hack-halt]  Reward-hacking detector for GRPO — LIVE callback (v0.70.0; live v0.71.11)
 soup train --reward-hack-mitigation off|log_only|kl_control|pid_lagrangian  Closed-loop reward-hacking auto-mitigation (detect → raise KL/β → rollback → early-stop); GRPO/PPO, requires --reward-hack-detector; PPO BETA (v0.71.26)
-soup train --uld-strategy wasserstein_aligned  Cross-tokenizer ULD on task='distill' (different tokenizers) — LIVE (v0.71.18)
+soup train --config soup.yaml  # training.uld_strategy: wasserstein_aligned  Cross-tokenizer ULD on task='distill' (different tokenizers) — LIVE (v0.71.18)
 soup train --config soup.yaml  # training.minillm_enabled: true [minillm_teacher_mix_ratio 0.3]  MiniLLM reverse-KL distillation, config-only — LIVE; offline mix 0 rejected (v0.70.0; live v0.71.11; #692, #979)
-soup train --rl-checkpoint-save-every-steps N [--rl-checkpoint-keep-last N]  Mid-epoch checkpoint for GRPO/PPO — LIVE (v0.70.0; live v0.71.11)
-soup train --echo-trap-enabled [--echo-trap-threshold 0.6 --echo-trap-halt]  RAGEN echo-trap detector for GRPO — LIVE callback (v0.70.0; live v0.71.11)
+soup train --config grpo.yaml  # training.rl_checkpoint_save_every_steps: N [rl_checkpoint_keep_last: N; rl_checkpoint_include_optimizer: true]  Mid-epoch checkpoint for GRPO/PPO — LIVE (v0.70.0; live v0.71.11)
+soup train --config grpo.yaml  # training.echo_trap_enabled: true [echo_trap_threshold: 0.6; echo_trap_halt: true]  RAGEN echo-trap detector for GRPO — LIVE callback (v0.70.0; live v0.71.11)
 soup train  # task='moe_lora_routing' + mole_task_adapters  MoLE per-token gate over N frozen task LoRAs (gate-only train) — LIVE (v0.71.12)
 soup train  # task='distill' + distill_mode=token|sequence  Token logit-KL or sequence-level teacher-continuation KD — LIVE (v0.71.12)
 soup train  # task=classifier|reranker|cross_encoder + lora  LoRA-adapter classifier (frozen encoder) — LIVE (v0.71.12)
 soup train  # use_mod | expand_layers | use_longlora  Mixture-of-Depths / LLaMA Pro / LongLoRA S² (Llama/Qwen/Mistral[/Phi]) — LIVE (v0.71.12)
 soup train  # task='tts' + tts_family + modality='audio_out'  TTS fine-tune via SFT CE over pre-encoded codec tokens; emotion templating; live-codec hw-gated — LIVE (v0.71.20)
-soup train  # task in {sft,pretrain,dpo} + moe_expert_quant=nf4|int8_rowwise [+moe_lora]  bnb per-expert quant of fused-MoE experts (CUDA) — LIVE (v0.71.20)
-soup train  # train_router_only=true [+moe_lora]  Freeze MoE experts, train only the gating router — LIVE (v0.71.20)
+soup train  # task in {sft,tts} + moe_expert_quant=nf4|int8_rowwise [+moe_lora]  bnb per-expert quant of fused-MoE experts (CUDA); refused on other tasks, which never applied it (#798) — LIVE (v0.71.20)
+soup train  # task in {sft,tts} + train_router_only=true [+moe_lora]  Freeze MoE experts, train only the gating router; refused on other tasks (#798). moe_lora needs lora.dropout: 0.0 on fused-expert MoEs — LIVE (v0.71.20)
 soup train  # quantization='bitnet_1.58'  BitNet 1.58 training is not implemented; config load refuses it
 soup export --model ./output --format bitnet|tq1_0  BitNet 1.58 TQ1_0 ternary GGUF via llama.cpp — LIVE (v0.71.20)
 soup version [--full] [--json]                Show version (--full: system info, --json: JSON output)
@@ -472,3 +472,21 @@ mutating tools (`train_start`, `export`) are gated behind `--allow-mutating`
 - **Concurrency & Disconnects:** Enforces 1 active execution at a time, gated on a persisted run whose process is still alive — so a **restarted** server does not launch a second training while a child from a previous server is still running, and a stale record whose process is gone never blocks execution. A `launching` record (committed before the child process exists, pid not yet written) blocks restart capacity too: it is indistinguishable from "about to spawn", so treating it as live is the safe direction after a crash in that window. If a server crash leaves that row behind, `soup mcp runs reconcile --expunge-launching` removes rows older than five minutes and prints every removed `run_id`; use `--older-than-seconds N` to choose another positive threshold. The command refuses the whole operation if any candidate records a PID that is still alive. Launches run in background (fire-and-forget). Disconnecting the MCP client does not terminate an already-running subprocess.
 - **Config Snapshotting & Input Revalidation:** At plan time (`train_start`), the validated config is snapshotted to `.soup/mcp-runs/<run_id>/config.yaml`, and execution uses this snapshot rather than the original mutable config path. External protected inputs (such as datasets and model/checkpoint directories or files) are not frozen in the snapshot; instead, their content digests (computed via SHA-256 for regular files, or deterministic recursive content hashing over sorted relative file paths for directory trees, bounded by file-count and total-byte safety limits) are recorded at plan time and revalidated immediately before spawn. Modifying an external protected input between plan and execute invalidates the token. Modifying the original config path after planning has no effect because execution strictly uses the snapshotted config. Snapshotting freezes only the configuration itself, not external filesystem assets.
 - **Every Local Input Is Pinned:** A train plan pins every local file or directory the run reads (model, datasets, reward/teacher/PRM models, reward `.py` files, unlearning sets); an input outside the working directory is refused at plan time, and an input that did not exist at plan time must still not exist at execution.
+
+## Gate and Verdict Exit Codes
+
+Soup gate and verdict commands follow a unified, CI-friendly exit-code contract:
+
+| Exit Code | Constant | Meaning | Examples |
+|---|---|---|---|
+| `0` | `EXIT_OK` | PASS / OK / SHIP | Model passes gate; no regression; lock matches closure; valid dataset |
+| `2` | `EXIT_GATE_FAILED` | GATE FAILED / REGRESSION / DRIFT / DON'T SHIP | Metric regressed; behavior/checklist MAJOR; lock closure drifted; dataset unusable |
+| `3` | `EXIT_USAGE_ERROR` | USAGE / INPUT / CONFIG ERROR | Bad or invalid CLI flag; missing or unparseable input file; empty series |
+| `1` | `EXIT_RUNTIME_ERROR` | RUNTIME ERROR | Unexpected crash, environment incompatibility, or live inference error |
+
+The taxonomy applies consistently across `soup ship`, `soup eval gate`, `soup eval against`, `soup eval checklist`, `soup eval behavior`, `soup eval quant-check`, `soup lock check`, `soup expect`, `soup data validate`, and `soup data lint`.
+
+### Gate Verdict Drift vs. Operational Drift
+
+`soup lock check` operates as a CI gate command where exit `2` (`EXIT_GATE_FAILED`) indicates that the lock closure has drifted from the configuration (requiring regeneration via `soup lock write`), and exit `3` (`EXIT_USAGE_ERROR`) indicates an unparseable or missing lock file. In contrast, operational and environment commands (`soup env check`, `soup apply`, and `soup drift-alarm`) belong to the operational drift family where runtime divergence or ABI mismatch signals exit `3` (with exit `2` reserved for invalid arguments or path errors in those commands). Operational inspection tools such as `soup adapters audit` deliberately reside outside the gate taxonomy, exiting `1` on usage errors so CI can distinguish an agreement (`0`) or diverged (`2`) verdict from invocation errors.
+

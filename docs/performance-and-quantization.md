@@ -72,7 +72,7 @@ QAT works with all training tasks (SFT, DPO, GRPO, PPO, KTO, ORPO, SimPO, IPO, P
 For Ada, Hopper and Blackwell GPUs (RTX 40/50-series, L4, L40S, RTX 6000 Ada, H100 / H200, B100 / B200), train with float8 matmuls for ~2x speedup vs bf16 at comparable quality. This extends QAT infrastructure via `torchao.float8`:
 
 ```bash
-pip install "soup-cli[qat]"   # torchao >= 0.5.0 includes torchao.float8
+pip install "soup-cli[qat]"   # torchao (floor: TORCHAO_MIN_VERSION in utils/torchao_compat.py)
 ```
 
 ```yaml
@@ -988,6 +988,31 @@ For fused-MoE models trained with `moe_lora: true`, two live toggles:
 
 Both reject silently-no-op combinations: setting either flag without `moe_lora=true` fails at config load with an actionable message.
 
+**Which tasks read which flag (#798).** These were accepted on every task and applied by only some, so the stored config claimed a run that never happened:
+
+| flag | applied by | elsewhere |
+|---|---|---|
+| `moe_lora` | `sft`, `pretrain`, `tts`, and (since #798) `dpo`, `kto`, `orpo`, `simpo`, `grpo` | — |
+| `moe_expert_quant`, `train_router_only` | `sft`, `tts` | refused at config load, naming the task |
+| `moe_aux_loss_coeff` | `sft`, `tts`, `pretrain` | a **non-default** value is refused; the default `0.01` still loads, because every stored config and eleven shipped recipes write it |
+
+**`moe_lora` requires `lora.dropout: 0.0` on a fused-expert MoE.** transformers 5.x keeps a Qwen3-MoE's experts as fused 3-D parameters (`mlp.experts.gate_up_proj`), which peft adapts through `lora.ParamWrapper`, and that wrapper raises `lora.ParamWrapper does not work with lora_dropout != 0.` With the schema default of `0.05` the LoRA attach failed outright, so `moe_lora` did not work on any task — including `sft`. Soup now stops at the attach with a message naming the flag, instead of letting peft's reach the user, and all 31 shipped MoE recipes pin `lora.dropout: 0.0`. The check is made against the loaded model, not at config load: whether the experts are fused depends on the checkpoint and the transformers version, and a model with one module per expert takes dropout normally. A dense base is untouched — there the flag is a no-op.
+
+**`moe_lora` does not reach every MoE family (measured, v0.75.0).** `get_moe_target_modules` picks module names, and whether peft turns those into adapters on the fused expert parameters depends on the architecture. On tiny stand-ins with transformers 5.16.1 / peft 0.20.0:
+
+| family | expert adapters attach | recipes |
+|---|---|---|
+| `qwen3_moe` | yes | 11 |
+| `deepseek_v3` | yes | 6 |
+| `glm4_moe` | yes | 3 |
+| `minimax` | **no — attention-only** | 2 (`minimax-m3-sft`, `minimax-m3-dpo`) |
+| `mixtral` | **no — attention-only** | — |
+| `kimi_k2`, `mistral-large-3` | **not measured** (no stand-in builds here) | 9 |
+
+So `minimax-m3-sft` and `minimax-m3-dpo` still train attention-only LoRA: peft has no v4→v5 conversion mapping for those model types, so their experts are never targeted and the attach succeeds quietly. Extending target resolution per architecture is #1070. The nine `kimi-k2.x` and `mistral-large-3` recipes are untested rather than known-good — no tiny stand-in for those configs exists in the installed transformers.
+
+**`target_modules: auto` on a MoE base.** `resolve_lora_target_modules` has no mapping for `qwen3_moe`, so `auto` resolved to `None` and peft refused with `No target_modules passed but also no target_parameters found`. With `moe_lora: true` the targets come from the model scan instead, which is what the 15 DPO/GRPO recipes needed.
+
 
 ## Unsloth Dynamic 2.0 GGUF Ladder (v0.53.0)
 
@@ -1017,10 +1042,10 @@ Three TrainingConfig bools extend the v0.28.0 FP8 menu. `fp8_attention` and `nvf
 torchao converters as of v0.71.21 (hardware-gated):
 
 - `fp8_attention: true` — requires `quantization_aware: fp8` AND a non-MLX backend. Converts the attention projections (q/k/v/o and fused variants) to torchao float8 training on Ada or newer GPUs (the same gate as `quantization_aware: fp8`). A card, OS or torch build the gate refuses stops the run at setup; missing torchao degrades to a clear advisory; a conversion-phase failure raises an honest "model may be PARTIALLY converted" error instead of training on a half-converted model.
-- `nvfp4: true` — Blackwell-only FP4 training via torchao `NVFP4Config` + `quantize_`. Gated to non-MLX + `modality: text`; the SM ≥ 10 runtime check fires at trainer construction.
+- `nvfp4: true` — Blackwell-only FP4 training via torchao `NVFP4TrainingConfig` + `quantize_`, which replaces `nn.Linear` with `NVFP4Linear` and quantises the forward **and backward** GEMMs. (Through v0.75.0 Soup asked for `NVFP4Config`, a name torchao has never exported, so the flag degraded to a yellow advisory and a bf16 run — #826.) Gated to supported tasks (rejected on `task: distill` and tasks without v0.28 speed/memory wiring) + non-MLX + `modality: text`; the SM ≥ 10 runtime check fires at trainer construction. The fix makes the flag **reach** NVFP4 training — the linears really are replaced by `NVFP4Linear`. A training step on top of that has torchao's own requirements, which Soup does not check for you: the kernels are triton, and `nvfp4_mm_triton` raises `ValueError: requires M, K, N all divisible by 128` for a shape it cannot serve (`torchao/prototype/moe_training/nvfp4_training/nvfp4_linear.py`), so a model whose hidden/intermediate sizes are not multiples of 128 will fail there rather than train slowly.
 - `unsloth_bnb_4bit: true` — promotes "Unsloth Dynamic 4-bit" from an implicit `backend=unsloth + quantization=4bit` combo to a named flag. Mutual rejection of inconsistent combos at config load.
 
-Cross-validator ordering picks the most actionable error: `quantization_aware='fp8'` prerequisite fires before the MLX rejection on `fp8_attention`, so a YAML missing both surfaces the deeper issue first.
+Cross-validator ordering picks the most actionable error: `quantization_aware='fp8'` prerequisite fires before the MLX rejection on `fp8_attention`, and task compatibility checks fire at config load before runtime trainer construction.
 
 
 ## LF / Axolotl Quant Parity (v0.53.0)
@@ -1034,7 +1059,7 @@ Cross-validator ordering picks the most actionable error: `quantization_aware='f
 
 `soup merge --save-format 4bit` and `--save-format 4bit_forced` will write a single BNB-4bit-quantized merged checkpoint without the wasteful dequant → merge → requant cycle (unsloth `merged_4bit` recipe). v0.53.0 ships the closed allowlist + spec metadata; the live writer lands in v0.53.1.
 
-`soup export --format torchao --quant-config <yaml>` is the planned PTQ export surface for `torchao.quantize_` + `save_pretrained`. Four schemes are allowlisted: `Int4WeightOnly`, `Int8DynActInt4`, `Float8DynActFloat8`, `NVFP4`. CASE-SENSITIVE — these are PyTorch class names and `torchao.quantize_` looks them up by exact name. Diverges from `--save-format` (lowercase-normalised) on purpose; documented at both validators.
+`soup export --format torchao --quant-config <yaml>` is the planned PTQ export surface for `torchao.quantize_` + `save_pretrained`. Four schemes are allowlisted: `Int4WeightOnly`, `Int8DynActInt4`, `Float8DynActFloat8`, `NVFP4`. CASE-SENSITIVE — these are Soup's scheme names, mapped to the torchao class that implements each one in `utils/torchao_compat.py` (three of the four names Soup used to look up by `hasattr` do not exist in torchao; #826). `Int4WeightOnly` accepts `group_size`; `inner_k_tiles` was removed, because `Int4WeightOnlyConfig` raises `TypeError` for it. Diverges from `--save-format` (lowercase-normalised) on purpose; documented at both validators.
 
 
 ## Quant Menu II + Export Pipeline (v0.53.1)

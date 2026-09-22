@@ -21,6 +21,8 @@ import pathlib
 
 import pytest
 
+from tests.conftest import strip_ansi
+
 pytestmark = pytest.mark.unit
 
 
@@ -707,6 +709,7 @@ class TestEverySettingCanActuallyDiverge:
     #: gradient_checkpointing is unset so the schema default False applies.
     DIVERGENT = [
         ("optimizer", {"optimizer": "SGD"}),
+        ("learning_rate", {"peak_lr": 2e-4}),
         ("scheduler", {"scheduler": "linear"}),
         ("warmup_ratio", {"warmup_updates": 7}),
         ("weight_decay", {"weight_decay": 0.5}),
@@ -1612,8 +1615,8 @@ class TestTheSummaryCountsWhatItFound:
         for key in ("max_grad_norm", "weight_decay"):
             del record[key]
         res = self._run(tmp_path, record)
-        assert "1 divergence(s)" in res.output, res.output
-        assert "2 unchecked" in res.output, res.output
+        assert "1 divergence(s)" in strip_ansi(res.output), res.output
+        assert "2 unchecked" in strip_ansi(res.output), res.output
 
 
 class TestAdapterSuppliedTextCannotDriveTheTerminal:
@@ -2018,4 +2021,4 @@ class TestAMalformedLoraBlockIsAVerdictNotAPathError:
 
         res = _runner().invoke(app, ["audit", ".", "--config", "soup.yaml"])
         assert res.exit_code == 2, res.output
-        assert "1 divergence(s)" in res.output
+        assert "1 divergence(s)" in strip_ansi(res.output)
