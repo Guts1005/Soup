@@ -13,8 +13,18 @@ trees).
 In Markdown and ReST, a line of ``=======`` is a legal setext-style heading
 underline or divider. To avoid crying wolf on valid documentation, a line equal
 to ``=======`` is flagged only when the file ALSO contains at least one conflict
-boundary marker (``<<<<<<< `` or ``>>>>>>> `` or ``||||||| ``). A file
+boundary marker (``<<<<<<<`` or ``>>>>>>>`` or ``|||||||``). A file
 containing only setext underlines without conflict boundaries produces zero hits.
+
+**Deliberately no escape hatch:**
+Consistent with ``.pre-commit-config.yaml``'s own ``check-merge-conflict`` hook,
+there is deliberately no inline escape hatch comment. Genuine documentation
+illustrating conflict resolution should indent markers or format them mid-line.
+
+**Self-consistency:**
+This test file builds marker strings dynamically via concatenation (e.g.
+``"<" * 7``) and formats fixtures so literal markers never appear at column 0,
+preventing the scanner from ever flagging its own source code.
 """
 
 from __future__ import annotations
@@ -23,13 +33,20 @@ import io
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Defined via concatenation to avoid matching this test file's own source lines:
-MARKER_START = "<" * 7 + " "
-MARKER_END = ">" * 7 + " "
-MARKER_BASE = "|" * 7 + " "
+MARKER_START = "<" * 7
+MARKER_END = ">" * 7
+MARKER_BASE = "|" * 7
 MARKER_MID = "=" * 7
+
+
+def _is_marker_line(line: str, prefix: str) -> bool:
+    """Return True if line is exactly 7 chars or 7 chars followed by a space."""
+    return line == prefix or line.startswith(prefix + " ")
 
 
 def is_binary_file(path: Path) -> bool:
@@ -47,30 +64,33 @@ def find_conflict_markers(text: str) -> list[tuple[int, str, str]]:
 
     Returns a list of ``(lineno, marker_description, line_content)``.
 
-    A line starting with ``<<<<<<< ``, ``>>>>>>> ``, or ``||||||| `` is an
-    unambiguous conflict boundary marker and is always flagged.
+    A line starting with ``<<<<<<<``, ``>>>>>>>``, or ``|||||||`` (either bare
+    or followed by a space) is an unambiguous conflict boundary marker and is
+    always flagged.
 
     A line equal to ``=======`` is only flagged if the file also contains at
     least one conflict boundary marker, preventing false positives on valid
     Markdown/ReST setext heading underlines (#1125).
+
+    ``splitlines()`` natively strips LF and CRLF endings uniformly across OSes.
     """
     lines = text.splitlines()
-    # ponytail: ======= is legal Markdown/ReST setext underline; only flag it
+    # A line of ======= is legal Markdown/ReST setext underline; only flag it
     # as a conflict divider when the file also contains a boundary marker (#1125).
     has_boundary = any(
-        line.startswith(MARKER_START)
-        or line.startswith(MARKER_END)
-        or line.startswith(MARKER_BASE)
+        _is_marker_line(line, MARKER_START)
+        or _is_marker_line(line, MARKER_END)
+        or _is_marker_line(line, MARKER_BASE)
         for line in lines
     )
     hits: list[tuple[int, str, str]] = []
     for lineno, line in enumerate(lines, start=1):
-        if line.startswith(MARKER_START):
-            hits.append((lineno, "start marker (`<<<<<<< `)", line))
-        elif line.startswith(MARKER_END):
-            hits.append((lineno, "end marker (`>>>>>>> `)", line))
-        elif line.startswith(MARKER_BASE):
-            hits.append((lineno, "base ancestor marker (`||||||| `)", line))
+        if _is_marker_line(line, MARKER_START):
+            hits.append((lineno, "start marker (`<<<<<<<`)", line))
+        elif _is_marker_line(line, MARKER_END):
+            hits.append((lineno, "end marker (`>>>>>>>`)", line))
+        elif _is_marker_line(line, MARKER_BASE):
+            hits.append((lineno, "base ancestor marker (`|||||||`)", line))
         elif has_boundary and line.rstrip(" ") == MARKER_MID:
             hits.append((lineno, "divider marker (`=======`)", line))
     return hits
@@ -78,13 +98,16 @@ def find_conflict_markers(text: str) -> list[tuple[int, str, str]]:
 
 def _tracked_files() -> list[Path]:
     """Return all tracked files in the repository via `git ls-files`."""
-    out = subprocess.run(
-        ["git", "ls-files"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        out = subprocess.run(
+            ["git", "ls-files"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pytest.skip("guard requires a git checkout")
     return [REPO_ROOT / line for line in out.stdout.splitlines() if line]
 
 
@@ -163,11 +186,11 @@ class TestTheScannerCanActuallyFail:
         conflict_sample = "\n".join(
             [
                 "def calculate_total(items):",
-                MARKER_START + "HEAD",
+                MARKER_START + " HEAD",
                 "    return sum(item.price for item in items)",
                 MARKER_MID,
                 "    return math.fsum(item.price for item in items)",
-                MARKER_END + "feature-branch",
+                MARKER_END + " feature-branch",
                 "    pass",
             ]
         )
@@ -183,13 +206,13 @@ class TestTheScannerCanActuallyFail:
     def test_it_catches_diff3_base_ancestor_marker(self):
         diff3_sample = "\n".join(
             [
-                MARKER_START + "HEAD",
+                MARKER_START + " HEAD",
                 "foo = 1",
-                MARKER_BASE + "ancestor",
+                MARKER_BASE + " ancestor",
                 "foo = 0",
                 MARKER_MID,
                 "foo = 2",
-                MARKER_END + "remote",
+                MARKER_END + " remote",
             ]
         )
         hits = find_conflict_markers(diff3_sample)
@@ -198,18 +221,43 @@ class TestTheScannerCanActuallyFail:
         assert any("base ancestor marker" in k for k in kinds)
 
     def test_it_catches_lone_start_marker(self):
-        sample = f"line 1\n{MARKER_START}HEAD\nline 3\n"
+        sample = f"line 1\n{MARKER_START} HEAD\nline 3\n"
         hits = find_conflict_markers(sample)
         assert len(hits) == 1
         assert hits[0][0] == 2
         assert "start marker" in hits[0][1]
 
     def test_it_catches_lone_end_marker(self):
-        sample = f"line 1\nline 2\n{MARKER_END}main\n"
+        sample = f"line 1\nline 2\n{MARKER_END} main\n"
         hits = find_conflict_markers(sample)
         assert len(hits) == 1
         assert hits[0][0] == 3
         assert "end marker" in hits[0][1]
+
+    def test_it_catches_bare_markers_without_labels(self):
+        """Bare markers without branch labels or spaces must also be caught."""
+        sample = f"{MARKER_START}\nconflict\n{MARKER_MID}\nresolution\n{MARKER_END}\n"
+        hits = find_conflict_markers(sample)
+        assert len(hits) == 3, hits
+        assert "start marker" in hits[0][1]
+        assert "divider marker" in hits[1][1]
+        assert "end marker" in hits[2][1]
+
+    def test_crlf_line_endings_handled_uniformly(self):
+        """CRLF line endings (e.g. core.autocrlf on Windows) are handled identically."""
+        crlf_sample = (
+            f"line 1\r\n"
+            f"{MARKER_START} HEAD\r\n"
+            f"code\r\n"
+            f"{MARKER_MID}\r\n"
+            f"alt\r\n"
+            f"{MARKER_END} branch\r\n"
+        )
+        hits = find_conflict_markers(crlf_sample)
+        assert len(hits) == 3, hits
+        assert hits[0][0] == 2
+        assert hits[1][0] == 4
+        assert hits[2][0] == 6
 
     def test_markdown_setext_heading_underline_is_not_flagged(self):
         """CONTROL: ======= without conflict boundaries is valid Markdown/ReST (#1125)."""
@@ -257,10 +305,11 @@ class TestTheScannerCanActuallyFail:
         """End-to-end failure proof: a planted conflict marker turns red with file and line."""
         planted = tmp_path / "docs" / "reproduction.md"
         planted.parent.mkdir(parents=True, exist_ok=True)
-        planted.write_text(
-            f"# Title\n\n{MARKER_START}HEAD\nold content\n{MARKER_MID}\nnew\n{MARKER_END}11f798e\n",
-            encoding="utf-8",
+        planted_content = (
+            f"# Title\n\n{MARKER_START} HEAD\nold content\n"
+            f"{MARKER_MID}\nnew\n{MARKER_END} 11f798e\n"
         )
+        planted.write_text(planted_content, encoding="utf-8")
 
         offenders = scan_tracked_files([planted])
         assert len(offenders) == 3, offenders
@@ -268,3 +317,13 @@ class TestTheScannerCanActuallyFail:
         assert any("reproduction.md:3" in o and "start marker" in o for o in offenders)
         assert any("reproduction.md:5" in o and "divider marker" in o for o in offenders)
         assert any("reproduction.md:7" in o and "end marker" in o for o in offenders)
+
+    def test_non_git_checkout_skips(self, monkeypatch):
+        """Outside a git checkout or release archive, the guard skips cleanly."""
+        def mock_run(*args, **kwargs):
+            raise subprocess.CalledProcessError(1, ["git", "ls-files"])
+
+        monkeypatch.setattr(subprocess, "run", mock_run)
+        with pytest.raises(pytest.skip.Exception, match="guard requires a git checkout"):
+            _tracked_files()
+
