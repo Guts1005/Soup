@@ -168,24 +168,24 @@ def _item(*markers):
 
 class TestTheHook:
     def test_a_gpu_test_skips_without_cuda(self, monkeypatch):
-        monkeypatch.setattr(conftest, "cuda_available", lambda: False)
+        monkeypatch.setattr(conftest, "_cuda_device_available", lambda: False)
         with pytest.raises(pytest.skip.Exception, match="pytest -m gpu"):
             conftest.pytest_runtest_setup(_item(pytest.mark.gpu.mark))
 
     def test_the_reason_is_kept(self, monkeypatch):
-        monkeypatch.setattr(conftest, "cuda_available", lambda: False)
+        monkeypatch.setattr(conftest, "_cuda_device_available", lambda: False)
         with pytest.raises(pytest.skip.Exception, match="peak VRAM needs CUDA"):
             conftest.pytest_runtest_setup(
                 _item(pytest.mark.gpu(reason="peak VRAM needs CUDA").mark)
             )
 
     def test_a_gpu_test_runs_with_cuda(self, monkeypatch):
-        monkeypatch.setattr(conftest, "cuda_available", lambda: True)
+        monkeypatch.setattr(conftest, "_cuda_device_available", lambda: True)
         conftest.pytest_runtest_setup(_item(pytest.mark.gpu.mark))
 
     def test_an_unmarked_test_runs_without_cuda(self, monkeypatch):
         """Control: the hook skips the marker, not everything."""
-        monkeypatch.setattr(conftest, "cuda_available", lambda: False)
+        monkeypatch.setattr(conftest, "_cuda_device_available", lambda: False)
         conftest.pytest_runtest_setup(_item())
         conftest.pytest_runtest_setup(_item(pytest.mark.smoke.mark))
 
@@ -246,8 +246,11 @@ class TestDeviceCountGating:
 
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 0)
-
-        assert conftest._cuda_device_available() is False
+        conftest._cuda_device_available.cache_clear()
+        try:
+            assert conftest._cuda_device_available() is False
+        finally:
+            conftest._cuda_device_available.cache_clear()
 
     def test_predicate_returns_true_when_device_is_available_and_visible(
         self, monkeypatch
@@ -257,8 +260,11 @@ class TestDeviceCountGating:
 
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 1)
-
-        assert conftest._cuda_device_available() is True
+        conftest._cuda_device_available.cache_clear()
+        try:
+            assert conftest._cuda_device_available() is True
+        finally:
+            conftest._cuda_device_available.cache_clear()
 
     def test_predicate_returns_false_when_torch_cuda_not_available(self, monkeypatch):
         """When is_available() is False, probe returns False even if count were positive."""
@@ -266,8 +272,11 @@ class TestDeviceCountGating:
 
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 1)
-
-        assert conftest._cuda_device_available() is False
+        conftest._cuda_device_available.cache_clear()
+        try:
+            assert conftest._cuda_device_available() is False
+        finally:
+            conftest._cuda_device_available.cache_clear()
 
     def test_exported_cuda_available_answers_is_available(self, monkeypatch):
         """Exported cuda_available() continues answering is_available() (#1128 review)."""
@@ -288,9 +297,12 @@ class TestDeviceCountGating:
 
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 0)
-
-        with pytest.raises(pytest.skip.Exception, match="needs a CUDA device"):
-            conftest.pytest_runtest_setup(_item(pytest.mark.gpu.mark))
+        conftest._cuda_device_available.cache_clear()
+        try:
+            with pytest.raises(pytest.skip.Exception, match="needs a CUDA device"):
+                conftest.pytest_runtest_setup(_item(pytest.mark.gpu.mark))
+        finally:
+            conftest._cuda_device_available.cache_clear()
 
     def test_gpu_test_runs_when_initial_device_count_is_positive(self, monkeypatch):
         """End-to-end hook check: positive visible devices allows test to run (#1128)."""
@@ -298,5 +310,38 @@ class TestDeviceCountGating:
 
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 1)
+        conftest._cuda_device_available.cache_clear()
+        try:
+            conftest.pytest_runtest_setup(_item(pytest.mark.gpu.mark))
+        finally:
+            conftest._cuda_device_available.cache_clear()
 
-        conftest.pytest_runtest_setup(_item(pytest.mark.gpu.mark))
+    def test_subprocess_initial_count_matches_fresh_probe_under_env(self):
+        """Reload conftest in child processes and assert _INITIAL_CUDA_DEVICE_COUNT matches probe.
+
+        Verifies the pinned constant reflects a fresh probe (#1128).
+        """
+        import os
+        import subprocess
+        import sys
+
+        code = (
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path.cwd()))\n"
+            "import tests.conftest as c\n"
+            "fresh = c._probe_initial_device_count()\n"
+            "assert c._INITIAL_CUDA_DEVICE_COUNT == fresh, "
+            "f'mismatch: pinned {c._INITIAL_CUDA_DEVICE_COUNT} vs fresh {fresh}'\n"
+        )
+        for env_val in ["", "-1"]:
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = env_val
+            res = subprocess.run(
+                [sys.executable, "-c", code],
+                env=env,
+                capture_output=True,
+                text=True,
+                cwd=str(TESTS.parent),
+            )
+            assert res.returncode == 0, f"Subprocess failed with CVD={env_val!r}:\n{res.stderr}"
