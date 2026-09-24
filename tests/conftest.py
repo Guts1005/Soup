@@ -40,7 +40,7 @@ def _cuda_device_available() -> bool:
 
 @functools.lru_cache(maxsize=None)
 def cuda_available() -> bool:
-    """CUDA probe for runtime code (#833). Probed once per session.
+    """The build probe for test bodies; the gpu marker uses _cuda_device_available() (#833).
 
     Fifteen modules had grown a private copy of this, and nine of them turned it
     into an identical ``requires_cuda`` skipif, so ``pytest -m gpu`` had nothing

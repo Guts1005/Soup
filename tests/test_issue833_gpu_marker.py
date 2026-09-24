@@ -166,6 +166,14 @@ def _item(*markers):
     return SimpleNamespace(get_closest_marker=lambda name: by_name.get(name))
 
 
+def _run_setup(item) -> None:
+    """Call the hook; a skip here is the regression under test, so report it as a failure."""
+    try:
+        conftest.pytest_runtest_setup(item)
+    except pytest.skip.Exception as exc:
+        pytest.fail(f"the hook skipped a test it should have run: {exc}")
+
+
 class TestTheHook:
     def test_a_gpu_test_skips_without_cuda(self, monkeypatch):
         monkeypatch.setattr(conftest, "_cuda_device_available", lambda: False)
@@ -181,13 +189,13 @@ class TestTheHook:
 
     def test_a_gpu_test_runs_with_cuda(self, monkeypatch):
         monkeypatch.setattr(conftest, "_cuda_device_available", lambda: True)
-        conftest.pytest_runtest_setup(_item(pytest.mark.gpu.mark))
+        _run_setup(_item(pytest.mark.gpu.mark))
 
     def test_an_unmarked_test_runs_without_cuda(self, monkeypatch):
         """Control: the hook skips the marker, not everything."""
         monkeypatch.setattr(conftest, "_cuda_device_available", lambda: False)
-        conftest.pytest_runtest_setup(_item())
-        conftest.pytest_runtest_setup(_item(pytest.mark.smoke.mark))
+        _run_setup(_item())
+        _run_setup(_item(pytest.mark.smoke.mark))
 
     def test_the_marker_is_registered(self, request):
         assert any(line.startswith("gpu:") for line in request.config.getini("markers"))
@@ -274,7 +282,7 @@ class TestDeviceCountGating:
     def test_gpu_test_runs_when_initial_device_count_is_positive(self, monkeypatch):
         """End-to-end hook check: positive visible devices allows test to run (#1128)."""
         monkeypatch.setattr(conftest, "_INITIAL_CUDA_DEVICE_COUNT", 1)
-        conftest.pytest_runtest_setup(_item(pytest.mark.gpu.mark))
+        _run_setup(_item(pytest.mark.gpu.mark))
 
     def test_subprocess_initial_count_matches_fresh_probe_under_env(self):
         """Reload conftest in child processes and assert _INITIAL_CUDA_DEVICE_COUNT matches probe.
