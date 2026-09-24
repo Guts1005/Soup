@@ -33,27 +33,14 @@ def _probe_initial_device_count() -> int:
 _INITIAL_CUDA_DEVICE_COUNT: int = _probe_initial_device_count()
 
 
-@functools.lru_cache(maxsize=1)
 def _cuda_device_available() -> bool:
-    """Check if a usable CUDA device was visible at session start (#1128).
-
-    Checking is_available() alone fails open when PyTorch is built with CUDA but
-    no device is exposed (e.g. under CUDA_VISIBLE_DEVICES=""), causing gpu-marked
-    tests to run and crash instead of skipping.
-    """
-    try:
-        import torch
-    except Exception:
-        return False
-    try:
-        return bool(torch.cuda.is_available() and _INITIAL_CUDA_DEVICE_COUNT > 0)
-    except Exception:  # noqa: BLE001
-        return False
+    """Check if a usable CUDA device was visible at session start (#1128)."""
+    return _INITIAL_CUDA_DEVICE_COUNT > 0
 
 
 @functools.lru_cache(maxsize=None)
 def cuda_available() -> bool:
-    """THE one CUDA probe for the test suite (#833). Probed once per session.
+    """CUDA probe for runtime code (#833). Probed once per session.
 
     Fifteen modules had grown a private copy of this, and nine of them turned it
     into an identical ``requires_cuda`` skipif, so ``pytest -m gpu`` had nothing
