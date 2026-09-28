@@ -35,19 +35,14 @@ _HW_FIT_OPTIMIZERS = frozenset({
 })
 
 _UNWIRED_TRAINING_TUNABLES = (
-    "forgetting_eval_steps",
+    # Group B tunables (forgetting_eval_steps, forgetting_benchmark, forgetting_stop,
+    # checkpoint_eval_steps, checkpoint_eval_metric, checkpoint_eval_tasks,
+    # checkpoint_keep_top, convergence_window, convergence_rel_tol) moved to
+    # config/staged_fields.py (#808), and early_stop_patience moved in #761:
+    # the loader warns about them with the refusal date, so they are not listed here.
     "forgetting_threshold",
-    "forgetting_benchmark",
-    "forgetting_stop",
-    "checkpoint_eval_steps",
-    "checkpoint_eval_metric",
-    "checkpoint_eval_tasks",
-    "checkpoint_keep_top",
-    # early_stop_patience moved to config/staged_fields.py (#761): the loader
-    # warns about it with the refusal date, so it is not listed here as well.
-    "convergence_window",
-    "convergence_rel_tol",
 )
+
 
 
 def _nondefault_unwired_training_settings(training_config) -> list[str]:
