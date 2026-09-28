@@ -694,8 +694,8 @@ Records peak memory each step. When pressure crosses the threshold, recommends a
 The `forgetting_detection`, `checkpoint_intelligence`, `early_stop_on_regression`, `convergence_detection`, and `forgetting_threshold` settings are
 reserved for planned in-training callbacks. They are accepted by the schema but
 are not enforced during training in this build. `soup train` prints an advisory note
-when one is enabled, directing users to `--gate <suite.yaml>`.
-The Group B tunables (`forgetting_eval_steps`, `forgetting_benchmark`, `forgetting_stop`,
+when one is set away from its default, directing users to `--gate <suite.yaml>`.
+Their tuning knobs (`forgetting_eval_steps`, `forgetting_benchmark`, `forgetting_stop`,
 `checkpoint_eval_steps`, `checkpoint_eval_metric`, `checkpoint_eval_tasks`, `checkpoint_keep_top`,
 `convergence_window`, and `convergence_rel_tol`) emit a load-time warning in v0.76
 and are refused as of v0.77 per #808, alongside `early_stop_patience` (#761), so each

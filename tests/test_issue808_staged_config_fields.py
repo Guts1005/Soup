@@ -330,10 +330,13 @@ class TestLoaderStagedFieldIntegration:
         assert cfg.training.convergence_rel_tol == 0.005
         assert capsys.readouterr().out == ""
 
-    def test_group_b_tunables_no_longer_listed_in_train_command(self) -> None:
+    def test_group_b_tunables_no_longer_listed_in_train_command(
+        self, monkeypatch
+    ) -> None:
         """Group B tunables are staged fields; train command lists only enabled flags."""
         from soup_cli.commands.train import _nondefault_unwired_training_settings
 
+        monkeypatch.setattr(loader, "STAGED_FIELD_SEVERITY", "warn")
         yaml_str = _VALID + "\ntraining:\n  convergence_rel_tol: 5e-3\n  convergence_window: 50\n"
         cfg = loader.load_config_from_string(yaml_str)
         assert _nondefault_unwired_training_settings(cfg.training) == []
@@ -364,6 +367,21 @@ class TestGroupBTunablesIntegration:
         "training.convergence_window": "training:\n  convergence_window: 100\n",
         "training.convergence_rel_tol": "training:\n  convergence_rel_tol: 0.01\n",
     }
+
+    def test_soup_train_note_names_no_staged_field(self, monkeypatch) -> None:
+        """Each knob is reported once, by the loader; soup train's note adds none (#808)."""
+        from soup_cli.commands.train import (
+            _UNWIRED_TRAINING_TUNABLES,
+            _nondefault_unwired_training_settings,
+        )
+
+        staged = {name for section, name in STAGED_FIELDS if section == "training"}
+        assert not staged & set(_UNWIRED_TRAINING_TUNABLES)
+
+        monkeypatch.setattr(loader, "STAGED_FIELD_SEVERITY", "warn")
+        body = "".join(case.split("\n", 1)[1] for case in self._GROUP_B_CASES.values())
+        cfg = loader.load_config_from_string(_VALID + "\ntraining:\n" + body)
+        assert _nondefault_unwired_training_settings(cfg.training) == []
 
     @pytest.mark.parametrize("path", sorted(_GROUP_B_CASES))
     def test_group_b_knob_warns_with_deadline_under_warn_severity(
@@ -406,4 +424,4 @@ class TestGroupBTunablesIntegration:
             + "  convergence_rel_tol: 0.005\n"
         )
         loader.load_config_from_string(yaml_defaults)
-        assert "read by nothing" not in capsys.readouterr().out
+        assert "read by nothing" not in _plain(capsys.readouterr().out)

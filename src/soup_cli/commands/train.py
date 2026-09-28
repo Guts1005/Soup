@@ -44,7 +44,6 @@ _UNWIRED_TRAINING_TUNABLES = (
 )
 
 
-
 def _nondefault_unwired_training_settings(training_config) -> list[str]:
     """Return staged training settings whose value differs from the schema default."""
     fields = type(training_config).model_fields
@@ -946,9 +945,10 @@ def train(
         cfg.training.eval_gate = EvalGateConfig(enabled=True, suite=gate)
         console.print(f"[green]Eval gate enabled[/] with suite: {gate}")
 
-    # Honesty guard: these staged knobs are accepted but are not enforced
-    # mid-training in this build. Warn for every non-default member of the
-    # families, not only their enable flags, so a tuned no-op is never silent.
+    # Honesty guard: these staged flags (plus forgetting_threshold) are accepted
+    # but not enforced mid-training in this build. Their other tuning knobs are
+    # reported by the loader with refusal dates, so only active flags and
+    # non-default forgetting_threshold are reported here.
     _unwired_gates = _nondefault_unwired_training_settings(cfg.training)
     if _unwired_gates:
         console.print(
