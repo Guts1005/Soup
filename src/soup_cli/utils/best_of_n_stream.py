@@ -501,6 +501,12 @@ def stage_offline_datasets(
             dpo_count=dpo_count,
         )
     except Exception:
+        if sft_fd >= 0:
+            os.close(sft_fd)
+            sft_fd = -1
+        if dpo_fd >= 0:
+            os.close(dpo_fd)
+            dpo_fd = -1
         for path in (sft_temp, dpo_temp):
             if path and os.path.exists(path):
                 os.unlink(path)
