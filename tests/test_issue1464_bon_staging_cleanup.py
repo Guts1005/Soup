@@ -4,12 +4,43 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from unittest.mock import Mock
 
 import pytest
 from typer.testing import CliRunner
 
 from soup_cli.utils.best_of_n_stream import stage_offline_datasets
+
+
+def _track_mkstemp_and_spy_unlink(monkeypatch):
+    """Track tempfile.mkstemp descriptors and assert they are closed before os.unlink (#1464)."""
+    tracked_fds: dict[int, str] = {}
+    unlinked_paths: list[str] = []
+    orig_mkstemp = tempfile.mkstemp
+    orig_unlink = os.unlink
+
+    def _tracking_mkstemp(*args, **kwargs):
+        fd, path = orig_mkstemp(*args, **kwargs)
+        tracked_fds[fd] = os.path.abspath(path)
+        return fd, path
+
+    def _spying_unlink(path):
+        abs_p = os.path.abspath(path)
+        unlinked_paths.append(abs_p)
+        for fd, fpath in tracked_fds.items():
+            if fpath == abs_p:
+                try:
+                    os.fstat(fd)
+                    pytest.fail(f"File {path} was unlinked while descriptor {fd} was still open!")
+                except OSError:
+                    # Descriptor is closed as required
+                    pass
+        return orig_unlink(path)
+
+    monkeypatch.setattr(tempfile, "mkstemp", _tracking_mkstemp)
+    monkeypatch.setattr(os, "unlink", _spying_unlink)
+    return unlinked_paths
 
 
 def test_stage_offline_datasets_file_in_place_of_emit_pairs_dir_cleans_up(tmp_path, monkeypatch):
@@ -24,19 +55,17 @@ def test_stage_offline_datasets_file_in_place_of_emit_pairs_dir_cleans_up(tmp_pa
     index = Mock()
     index.iter_rows = Mock(return_value=[])
 
+    unlinked = _track_mkstemp_and_spy_unlink(monkeypatch)
+
     with pytest.raises(OSError) as excinfo:
         stage_offline_datasets(index, sft_out, dpo_out)
 
-    # Must raise the original filesystem error (e.g. FileExistsError or NotADirectoryError),
-    # never a masked Windows PermissionError [WinError 32].
-    assert not isinstance(excinfo.value, PermissionError), (
-        f"Expected filesystem error, got PermissionError: {excinfo.value}"
-    )
     if os.name == "nt":
         # On Windows, os.makedirs over a file raises FileExistsError ([WinError 183])
         assert isinstance(excinfo.value, (FileExistsError, NotADirectoryError))
         assert "183" in str(excinfo.value) or "already exists" in str(excinfo.value).lower()
 
+    assert len(unlinked) == 1, f"Expected 1 unlinked staging file (sft), got {unlinked}"
     leftovers = [str(p) for p in tmp_path.glob(".soup.group.*.tmp")]
     assert not leftovers, f"Leftover staging files were not cleaned up: {leftovers}"
 
@@ -166,6 +195,8 @@ def test_stage_offline_datasets_second_fdopen_failure_closes_dpo_fd_and_cleans_u
     index = Mock()
     index.iter_rows = Mock(return_value=[])
 
+    unlinked = _track_mkstemp_and_spy_unlink(monkeypatch)
+
     orig_fdopen = os.fdopen
     calls = 0
 
@@ -178,14 +209,10 @@ def test_stage_offline_datasets_second_fdopen_failure_closes_dpo_fd_and_cleans_u
 
     monkeypatch.setattr(os, "fdopen", _mock_fdopen)
 
-    with pytest.raises(OSError) as excinfo:
+    with pytest.raises(OSError, match="simulated second fdopen failure"):
         stage_offline_datasets(index, sft_out, dpo_out)
 
-    assert "simulated second fdopen failure" in str(excinfo.value)
-    assert not isinstance(excinfo.value, PermissionError), (
-        f"Expected real OSError, got PermissionError: {excinfo.value}"
-    )
-
+    assert len(unlinked) == 2, f"Expected 2 unlinked staging files, got {unlinked}"
     leftovers = [str(p) for p in tmp_path.glob(".soup.group.*.tmp")]
     assert not leftovers, f"Leftover staging files were not cleaned up: {leftovers}"
 
@@ -194,40 +221,12 @@ def test_stage_offline_datasets_unlinks_after_descriptors_closed_cross_platform(
     tmp_path, monkeypatch
 ):
     """Staging files must have their descriptors closed before unlinking (#1464)."""
-    import tempfile
-
     monkeypatch.chdir(tmp_path)
 
     sft_out = str(tmp_path / "sft.jsonl")
     dpo_out = str(tmp_path / "dpo.jsonl")
 
-    tracked_fds: dict[int, str] = {}
-    orig_mkstemp = tempfile.mkstemp
-
-    def _tracking_mkstemp(*args, **kwargs):
-        fd, path = orig_mkstemp(*args, **kwargs)
-        tracked_fds[fd] = os.path.abspath(path)
-        return fd, path
-
-    monkeypatch.setattr(tempfile, "mkstemp", _tracking_mkstemp)
-
-    orig_unlink = os.unlink
-    unlinked_paths: list[str] = []
-
-    def _spying_unlink(path):
-        abs_p = os.path.abspath(path)
-        unlinked_paths.append(abs_p)
-        for fd, fpath in tracked_fds.items():
-            if fpath == abs_p:
-                try:
-                    os.fstat(fd)
-                    pytest.fail(f"File {path} was unlinked while descriptor {fd} was still open!")
-                except OSError:
-                    # Descriptor is closed as required
-                    pass
-        return orig_unlink(path)
-
-    monkeypatch.setattr(os, "unlink", _spying_unlink)
+    unlinked = _track_mkstemp_and_spy_unlink(monkeypatch)
 
     index = Mock()
 
@@ -240,6 +239,6 @@ def test_stage_offline_datasets_unlinks_after_descriptors_closed_cross_platform(
     with pytest.raises(RuntimeError, match="simulated stream failure"):
         stage_offline_datasets(index, sft_out, dpo_out)
 
-    assert len(unlinked_paths) == 2, f"Expected 2 unlinked files, got {unlinked_paths}"
+    assert len(unlinked) == 2, f"Expected 2 unlinked files, got {unlinked}"
     leftovers = [str(p) for p in tmp_path.glob(".soup.group.*.tmp")]
     assert not leftovers, f"Leftover staging files were not cleaned up: {leftovers}"
