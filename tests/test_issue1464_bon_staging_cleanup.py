@@ -152,3 +152,94 @@ def test_cli_best_of_n_offline_bad_emit_pairs_reports_real_error_and_cleans_up(
 
     leftovers = [str(p) for p in tmp_path.glob(".soup.group.*.tmp")]
     assert not leftovers, f"Leftover staging files in directory: {leftovers}"
+
+
+def test_stage_offline_datasets_second_fdopen_failure_closes_dpo_fd_and_cleans_up(
+    tmp_path, monkeypatch
+):
+    """When the second os.fdopen fails, dpo_fd is closed before unlinking (#1464)."""
+    monkeypatch.chdir(tmp_path)
+
+    sft_out = str(tmp_path / "sft.jsonl")
+    dpo_out = str(tmp_path / "dpo.jsonl")
+
+    index = Mock()
+    index.iter_rows = Mock(return_value=[])
+
+    orig_fdopen = os.fdopen
+    calls = 0
+
+    def _mock_fdopen(fd, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated second fdopen failure")
+        return orig_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", _mock_fdopen)
+
+    with pytest.raises(OSError) as excinfo:
+        stage_offline_datasets(index, sft_out, dpo_out)
+
+    assert "simulated second fdopen failure" in str(excinfo.value)
+    assert not isinstance(excinfo.value, PermissionError), (
+        f"Expected real OSError, got PermissionError: {excinfo.value}"
+    )
+
+    leftovers = [str(p) for p in tmp_path.glob(".soup.group.*.tmp")]
+    assert not leftovers, f"Leftover staging files were not cleaned up: {leftovers}"
+
+
+def test_stage_offline_datasets_unlinks_after_descriptors_closed_cross_platform(
+    tmp_path, monkeypatch
+):
+    """Staging files must have their descriptors closed before unlinking (#1464)."""
+    import tempfile
+
+    monkeypatch.chdir(tmp_path)
+
+    sft_out = str(tmp_path / "sft.jsonl")
+    dpo_out = str(tmp_path / "dpo.jsonl")
+
+    tracked_fds: dict[int, str] = {}
+    orig_mkstemp = tempfile.mkstemp
+
+    def _tracking_mkstemp(*args, **kwargs):
+        fd, path = orig_mkstemp(*args, **kwargs)
+        tracked_fds[fd] = os.path.abspath(path)
+        return fd, path
+
+    monkeypatch.setattr(tempfile, "mkstemp", _tracking_mkstemp)
+
+    orig_unlink = os.unlink
+    unlinked_paths: list[str] = []
+
+    def _spying_unlink(path):
+        abs_p = os.path.abspath(path)
+        unlinked_paths.append(abs_p)
+        for fd, fpath in tracked_fds.items():
+            if fpath == abs_p:
+                try:
+                    os.fstat(fd)
+                    pytest.fail(f"File {path} was unlinked while descriptor {fd} was still open!")
+                except OSError:
+                    # Descriptor is closed as required
+                    pass
+        return orig_unlink(path)
+
+    monkeypatch.setattr(os, "unlink", _spying_unlink)
+
+    index = Mock()
+
+    def _fail_iter():
+        raise RuntimeError("simulated stream failure")
+        yield
+
+    index.iter_rows = _fail_iter
+
+    with pytest.raises(RuntimeError, match="simulated stream failure"):
+        stage_offline_datasets(index, sft_out, dpo_out)
+
+    assert len(unlinked_paths) == 2, f"Expected 2 unlinked files, got {unlinked_paths}"
+    leftovers = [str(p) for p in tmp_path.glob(".soup.group.*.tmp")]
+    assert not leftovers, f"Leftover staging files were not cleaned up: {leftovers}"
